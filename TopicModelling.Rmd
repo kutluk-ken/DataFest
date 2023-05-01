@@ -1,0 +1,159 @@
+### Import data, libraries, and (possibly select a subset of the postText data)
+```{r}
+library(readr)
+library(topicmodels)
+library(tidytext)
+library(tidyverse)
+samples = 150000
+question_posts <- read_csv("questionposts.csv")
+qpm <- question_posts[1:samples, ]
+```
+
+### Create DTM and Vocabulary of keywords
+```{r}
+library(textmineR)
+library(text2vec)
+library(dplyr)
+dtm = CreateDtm(qpm$PostText, doc_names = qpm$Id, ngram_window = c(1, 2))
+
+tf <- TermDocFreq(dtm = dtm)
+original_tf <- tf %>% select(term, term_freq,doc_freq)
+rownames(original_tf) <- 1:nrow(original_tf)
+vocabulary <- tf$term[ tf$term_freq > 1 & tf$doc_freq < nrow(dtm) / 2 ]
+vocabulary
+```
+
+model
+```{r}
+k_list <- seq(30, 30, by = 1)
+model_dir <- paste0("models_", digest::digest(vocabulary, algo = "sha1"))
+if (!dir.exists(model_dir)) dir.create(model_dir)
+model_list <- TmParallelApply(X = k_list, FUN = function(k){
+  filename = file.path(model_dir, paste0(k, "_topics.rda"))
+  
+  if (!file.exists(filename)) {
+    m <- FitLdaModel(dtm = dtm, k = k, iterations = 500)
+    m$k <- k
+    m$coherence <- CalcProbCoherence(phi = m$phi, dtm = dtm, M = 5)
+    save(m, file = filename)
+  } else {
+    load(filename)
+  }
+  
+  m
+}, export=c("dtm", "model_dir")) # export only needed for Windows machines
+
+coherence_mat <- data.frame(k = sapply(model_list, function(x) nrow(x$phi)), 
+                            coherence = sapply(model_list, function(x) mean(x$coherence)), 
+                            stringsAsFactors = FALSE)
+coherence_mat
+
+# library(ggplot2)
+# ggplot(coherence_mat, aes(x = k, y = coherence)) +
+#   geom_point() +
+#   geom_line(group = 1)+
+#   ggtitle("Best Topic by Coherence Score") + theme_minimal() +
+#   scale_x_continuous(breaks = seq(35,45,1)) + ylab("Coherence")
+# k = 56, 0.2596
+```
+
+```{r}
+model <- model_list[which.max(coherence_mat$coherence)][[ 1 ]]
+model$top_terms <- GetTopTerms(phi = model$phi, M = 20)
+top20_wide <- as.data.frame(model$top_terms)
+top20_wide
+```
+
+```{r}
+model$topic_linguistic_dist <- CalcHellingerDist(model$phi)
+model$hclust <- hclust(as.dist(model$topic_linguistic_dist), "ward.D")
+model$hclust$labels <- paste(model$hclust$labels, model$labels[ , 1])
+plot(model$hclust)
+```
+
+```{r}
+find_column <- function(text, keyword_matrix) {
+  for (i in 1:nrow(keyword_matrix)) {
+    for (j in 1:ncol(keyword_matrix)) {
+      if (str_detect(text, keyword_matrix[i, j])) {
+        return(j)
+      }
+    }
+  }
+  return(NA)
+}
+
+mapping = c()
+for (i in 1:nrow(qpm)) {
+  text <- qpm$PostText[i]
+  mapping[i] <- find_column(text, top20_wide)
+}
+
+```
+
+### Merging Tables
+```{r}
+questions <- read_csv("questions.csv")
+questions <- questions[1:samples, ]
+
+clients <- read_csv("clients.csv")
+clients <- clients[1:samples, ]
+
+qpm <- qpm %>%
+  mutate(ClientUno = questions$AskedByClientUno) %>%
+  mutate(StateName = clients$StateName) %>%
+  mutate(County = clients$County) %>%
+  mutate(PostalCode = clients$PostalCode) %>%
+  mutate(EthnicIdentity = clients$EthnicIdentity) %>%
+  mutate(Age = clients$Age) %>%
+  mutate(Gender = clients$Gender) %>%
+  mutate(MaritalStatus = clients$MaritalStatus) %>%
+  mutate(Veteran = clients$Veteran) %>%
+  mutate(Imprisoned = clients$Imprisoned) %>%
+  mutate(NumberInHousehold = clients$NumberInHousehold) %>%
+  mutate(AnnualIncome = clients$AnnualIncome) %>%
+  mutate(AllowedIncome = clients$AllowedIncome) %>%
+  mutate(CheckingBalance = clients$CheckingBalance) %>%
+  mutate(SavingsBalance = clients$SavingsBalance) %>%
+  mutate(InvestmentsBalance = clients$InvestmentsBalance) %>%
+  select(ClientUno, PostText, StateName, County, PostalCode, EthnicIdentity, Age, Gender, MaritalStatus, Veteran, Imprisoned, NumberInHousehold, AnnualIncome, AllowedIncome, CheckingBalance, SavingsBalance, InvestmentsBalance)
+
+
+qpm <- qpm %>% mutate(Topic = mapping)
+
+# Remove Topic NA rows
+qpm <- qpm[complete.cases(qpm), ]
+qpm
+```
+
+
+
+
+```{r}
+#model <- glm(Topic ~ ., data = qpm)
+#step(model, test = "Chisq", direction = "backward")
+#urlPackage <- "https://cran.r-project.org/src/contrib/Archive/randomForest/randomForest_4.6-12.tar.gz"
+#install.packages(urlPackage, repos=NULL, type="source") 
+
+library(randomForest)
+library(caret)
+library(pROC)
+library(ggplot2)
+
+train_idx <- sample(nrow(qpm), round(0.7*nrow(qpm)), replace = FALSE)
+train_data <- qpm[train_idx, ]
+test_data <- qpm[-train_idx, ]
+rf_model <- randomForest(Topic ~ ., data = train_data, ntree = 1000)
+rf_probs <- predict(rf_model, newdata = test_data)
+rf_roc <- roc(test_data$Topic, rf_probs)
+plot(rf_roc, col = "green",print.auc = FALSE, legacy.axes = TRUE)
+
+```
+
+```{r}
+predicted_values <- predict(rf_model, type = "response")
+train_data <-train_data%>% mutate(predicted = round(predicted_values)) %>% select(ClientUno, StateName, County, PostalCode, EthnicIdentity, Age, Gender, MaritalStatus, Veteran, Imprisoned, NumberInHousehold, AnnualIncome, AllowedIncome, CheckingBalance, SavingsBalance, InvestmentsBalance,predicted)
+```
+
+
+
